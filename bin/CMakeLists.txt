@@ -1,4 +1,4 @@
-add_subdirectory(FileCheck)
+# add_subdirectory(FileCheck)
 # add_llvm_executable(FileCheck FileCheck/FileCheck.cpp)
 # target_link_libraries(FileCheck PRIVATE LLVMFileCheck LLVMSupport)
 
@@ -26,36 +26,36 @@ target_link_libraries(triton-opt PRIVATE
 mlir_check_all_link_libraries(triton-opt)
 
 
-add_llvm_executable(triton-translate triton-translate.cpp PARTIAL_SOURCES_INTENDED)
-llvm_update_compile_flags(triton-translate)
- target_link_libraries(triton-translate PRIVATE
-         TritonAnalysis
-         TritonTransforms
-         TritonGPUTransforms
-         TritonLLVMIR
-         TritonPTX
-         ${dialect_libs}
-         ${conversion_libs}
-         # tests
-         TritonTestAnalysis
+# add_llvm_executable(triton-translate triton-translate.cpp PARTIAL_SOURCES_INTENDED)
+# llvm_update_compile_flags(triton-translate)
+#  target_link_libraries(triton-translate PRIVATE
+#          TritonAnalysis
+#          TritonTransforms
+#          TritonGPUTransforms
+#          TritonLLVMIR
+#         #  TritonPTX
+#          ${dialect_libs}
+#          ${conversion_libs}
+#          # tests
+#          TritonTestAnalysis
 
-         LLVMCore
-         LLVMSupport
-         LLVMOption
-         LLVMCodeGen
-         LLVMAsmParser
+#          LLVMCore
+#          LLVMSupport
+#          LLVMOption
+#          LLVMCodeGen
+#          LLVMAsmParser
 
-         # MLIR core
-         MLIROptLib
-         MLIRIR
-         MLIRLLVMDialect
-         MLIRPass
-         MLIRSupport
-         MLIRTransforms
-         MLIRExecutionEngine
-         MLIRMathToLLVM
-         MLIRTransformUtils
-         MLIRLLVMToLLVMIRTranslation
-         MLIRNVVMToLLVMIRTranslation
-         )
-mlir_check_all_link_libraries(triton-translate)
+#          # MLIR core
+#          MLIROptLib
+#          MLIRIR
+#          MLIRLLVMDialect
+#          MLIRPass
+#          MLIRSupport
+#          MLIRTransforms
+#          MLIRExecutionEngine
+#          MLIRMathToLLVM
+#          MLIRTransformUtils
+#          MLIRLLVMToLLVMIRTranslation
+#          MLIRNVVMToLLVMIRTranslation
+#          )
+# mlir_check_all_link_libraries(triton-translate)

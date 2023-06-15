@@ -313,7 +313,16 @@ bool mlir::triton::ReduceOp::withIndex(mlir::triton::RedOp redOp) {
 }
 
 //-- SplatOp --
-OpFoldResult SplatOp::fold(FoldAdaptor adaptor) {
+// OpFoldResult SplatOp::fold(FoldAdaptor adaptor) {
+//   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
+//   if (!constOperand)
+//     return {};
+//   auto shapedType = getType().cast<ShapedType>();
+//   auto ret = SplatElementsAttr::get(
+//       shapedType, ArrayRef<Attribute>(constOperand.getValue()));
+//   return ret;
+// }
+OpFoldResult SplatOp::fold(ArrayRef<Attribute> operands) {
   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
   if (!constOperand)
     return {};
@@ -353,7 +362,26 @@ mlir::LogicalResult mlir::triton::ExpandDimsOp::inferReturnTypes(
 }
 
 //-- BroadcastOp --
-OpFoldResult BroadcastOp::fold(FoldAdaptor adaptor) {
+// OpFoldResult BroadcastOp::fold(FoldAdaptor adaptor) {
+//   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
+//   if (!constOperand)
+//     return {};
+
+//   auto shapedType = getType().cast<ShapedType>();
+//   auto value = constOperand.getValue();
+//   if (auto denseElemsAttr = value.dyn_cast<DenseElementsAttr>()) {
+//     if (!denseElemsAttr.isSplat())
+//       return {};
+//     return SplatElementsAttr::get(shapedType,
+//                                   denseElemsAttr.getSplatValue<Attribute>());
+//   } else if (value.getType().isIntOrIndexOrFloat()) {
+//     return SplatElementsAttr::get(shapedType, value);
+//   } else {
+//     return {};
+//   }
+// }
+
+OpFoldResult BroadcastOp::fold(ArrayRef<Attribute> operands) {
   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
   if (!constOperand)
     return {};

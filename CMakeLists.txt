@@ -71,7 +71,7 @@ if (NOT MLIR_DIR)
         AMDGPUInfo AMDGPUcodegen
       )
     else()
-      find_package(LLVM 11 REQUIRED COMPONENTS "nvptx;amdgpu")
+      find_package(LLVM 11 REQUIRED COMPONENTS "")
     endif()
     message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
     # FindLLVM outputs LLVM_LIBRARY_DIRS but we expect LLVM_LIBRARY_DIR here
@@ -83,12 +83,12 @@ if (NOT MLIR_DIR)
   else()
     set(LLVM_LDFLAGS "-L${LLVM_LIBRARY_DIR}")
     set(LLVM_LIBRARIES
-      libLLVMNVPTXCodeGen.a
-      libLLVMNVPTXDesc.a
-      libLLVMNVPTXInfo.a
-      libLLVMAMDGPUDisassembler.a
+      # libLLVMNVPTXCodeGen.a
+      # libLLVMNVPTXDesc.a
+      # libLLVMNVPTXInfo.a
+      # libLLVMAMDGPUDisassembler.a
       libLLVMMCDisassembler.a
-      libLLVMAMDGPUCodeGen.a
+      # libLLVMAMDGPUCodeGen.a
       libLLVMMIRParser.a
       libLLVMGlobalISel.a
       libLLVMSelectionDAG.a
@@ -113,10 +113,10 @@ if (NOT MLIR_DIR)
       libLLVMObject.a
       libLLVMTextAPI.a
       libLLVMBitReader.a
-      libLLVMAMDGPUAsmParser.a
+      # libLLVMAMDGPUAsmParser.a
       libLLVMMCParser.a
-      libLLVMAMDGPUDesc.a
-      libLLVMAMDGPUUtils.a
+      # libLLVMAMDGPUDesc.a
+      # libLLVMAMDGPUUtils.a
       libLLVMMC.a
       libLLVMDebugInfoCodeView.a
       libLLVMDebugInfoMSF.a
@@ -124,7 +124,7 @@ if (NOT MLIR_DIR)
       libLLVMRemarks.a
       libLLVMBitstreamReader.a
       libLLVMBinaryFormat.a
-      libLLVMAMDGPUInfo.a
+      # libLLVMAMDGPUInfo.a
       libLLVMSupport.a
       libLLVMDemangle.a
       libLLVMPasses.a
@@ -208,7 +208,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     TritonTransforms
     TritonGPUTransforms
     TritonLLVMIR
-    TritonPTX
+    # TritonPTX
     ${dialect_libs}
     ${conversion_libs}
     # optimizations
