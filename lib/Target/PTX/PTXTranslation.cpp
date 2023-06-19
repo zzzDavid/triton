@@ -1,6 +1,5 @@
 #include "triton/Target/PTX/PTXTranslation.h"
 #include "triton/Target/LLVMIR/LLVMIRTranslation.h"
-#include <optional>
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -12,13 +11,19 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
 
+#include <mutex>
+#include <optional>
+
 namespace triton {
 
 static void initLLVM() {
-  LLVMInitializeNVPTXTargetInfo();
-  LLVMInitializeNVPTXTarget();
-  LLVMInitializeNVPTXTargetMC();
-  LLVMInitializeNVPTXAsmPrinter();
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    LLVMInitializeNVPTXTargetInfo();
+    LLVMInitializeNVPTXTarget();
+    LLVMInitializeNVPTXTargetMC();
+    LLVMInitializeNVPTXAsmPrinter();
+  });
 }
 
 static bool findAndReplace(std::string &str, const std::string &begin,
@@ -50,7 +55,6 @@ std::string translateLLVMIRToPTX(llvm::Module &module, int cc, int version) {
   int ptxMajor = maxPTX / 10;
   int ptxMinor = maxPTX % 10;
   // create
-  llvm::SmallVector<char, 0> buffer;
   std::string triple = "nvptx64-nvidia-cuda";
   std::string proc = "sm_" + std::to_string(maxCC);
   std::string layout = "";
@@ -82,17 +86,19 @@ std::string translateLLVMIRToPTX(llvm::Module &module, int cc, int version) {
   else
     module.setDataLayout(layout);
   // emit machine code
-  for (llvm::Function &f : module.functions())
-    f.addFnAttr(llvm::Attribute::AlwaysInline);
-  llvm::legacy::PassManager pass;
-  llvm::raw_svector_ostream stream(buffer);
-  // emit
-  machine->addPassesToEmitFile(pass, stream, nullptr,
-                               llvm::CodeGenFileType::CGFT_AssemblyFile);
-  pass.run(module);
-
+  std::string result;
+  {
+    llvm::raw_string_ostream stream(result);
+    llvm::buffer_ostream pstream(stream);
+    for (llvm::Function &f : module.functions())
+      f.addFnAttr(llvm::Attribute::AlwaysInline);
+    llvm::legacy::PassManager pass;
+    // emit
+    machine->addPassesToEmitFile(pass, pstream, nullptr,
+                                 llvm::CodeGenFileType::CGFT_AssemblyFile);
+    pass.run(module);
+  }
   // post-process
-  std::string result(buffer.begin(), buffer.end());
   findAndReplace(result, ".version", "\n",
                  ".version " + std::to_string(ptxMajor) + "." +
                      std::to_string(ptxMinor) + "\n");

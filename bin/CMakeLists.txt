@@ -1,7 +1,3 @@
-# add_subdirectory(FileCheck)
-# add_llvm_executable(FileCheck FileCheck/FileCheck.cpp)
-# target_link_libraries(FileCheck PRIVATE LLVMFileCheck LLVMSupport)
-
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 
@@ -25,7 +21,28 @@ target_link_libraries(triton-opt PRIVATE
 
 mlir_check_all_link_libraries(triton-opt)
 
+add_llvm_executable(triton-reduce triton-reduce.cpp PARTIAL_SOURCES_INTENDED)
+mlir_check_all_link_libraries(triton-reduce)
 
+llvm_update_compile_flags(triton-reduce)
+target_link_libraries(triton-reduce PRIVATE
+  TritonAnalysis
+  TritonTransforms
+  TritonGPUTransforms
+  ${dialect_libs}
+  ${conversion_libs}
+  # tests
+  TritonTestAnalysis
+  # MLIR core
+  MLIRReduceLib
+  MLIRPass
+  MLIRTransforms
+)
+
+mlir_check_all_link_libraries(triton-reduce)
+
+
+<<<<<<< HEAD
 # add_llvm_executable(triton-translate triton-translate.cpp PARTIAL_SOURCES_INTENDED)
 # llvm_update_compile_flags(triton-translate)
 #  target_link_libraries(triton-translate PRIVATE
@@ -59,3 +76,40 @@ mlir_check_all_link_libraries(triton-opt)
 #          MLIRNVVMToLLVMIRTranslation
 #          )
 # mlir_check_all_link_libraries(triton-translate)
+=======
+add_llvm_executable(triton-translate triton-translate.cpp PARTIAL_SOURCES_INTENDED)
+llvm_update_compile_flags(triton-translate)
+ target_link_libraries(triton-translate PRIVATE
+         TritonAnalysis
+         TritonTransforms
+         TritonGPUTransforms
+         TritonLLVMIR
+         TritonPTX
+         TritonHSACO
+         ${dialect_libs}
+         ${conversion_libs}
+         # tests
+         TritonTestAnalysis
+
+         LLVMCore
+         LLVMSupport
+         LLVMOption
+         LLVMCodeGen
+         LLVMAsmParser
+
+         # MLIR core
+         MLIROptLib
+         MLIRIR
+         MLIRLLVMDialect
+         MLIRPass
+         MLIRSupport
+         MLIRTransforms
+         MLIRExecutionEngine
+         MLIRMathToLLVM
+         MLIRTransformUtils
+         MLIRLLVMToLLVMIRTranslation
+         MLIRNVVMToLLVMIRTranslation
+         MLIRROCDLToLLVMIRTranslation
+         )
+mlir_check_all_link_libraries(triton-translate)
+>>>>>>> triton-to-linalg

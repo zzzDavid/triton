@@ -63,8 +63,8 @@ class Prefetcher {
 
   Value generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
                          Attribute dotEncoding, OpBuilder &builder,
-                         llvm::Optional<int64_t> offsetK = std::nullopt,
-                         llvm::Optional<int64_t> shapeK = std::nullopt);
+                         std::optional<int64_t> offsetK = std::nullopt,
+                         std::optional<int64_t> shapeK = std::nullopt);
 
 public:
   Prefetcher() = delete;
@@ -82,8 +82,8 @@ public:
 
 Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
                                    Attribute dotEncoding, OpBuilder &builder,
-                                   llvm::Optional<int64_t> offsetK,
-                                   llvm::Optional<int64_t> shapeK) {
+                                   std::optional<int64_t> offsetK,
+                                   std::optional<int64_t> shapeK) {
   // opIdx: 0 => a, 1 => b
   auto type = v.getType().cast<RankedTensorType>();
   SmallVector<int64_t> shape{type.getShape().begin(), type.getShape().end()};
@@ -103,11 +103,9 @@ Value Prefetcher::generatePrefetch(Value v, unsigned opIdx, bool isPrologue,
   if (offsetK)
     offset[kIdx] = *offsetK;
 
-  Value newSmem = builder.create<tensor::ExtractSliceOp>(
-      v.getLoc(),
-      // TODO: encoding?
-      RankedTensorType::get(shape, elementType, type.getEncoding()), v,
-      SmallVector<OpFoldResult>{intAttr(offset[0]), intAttr(offset[1])},
+  Value newSmem = builder.create<triton::gpu::ExtractSliceOp>(
+      v.getLoc(), RankedTensorType::get(shape, elementType, type.getEncoding()),
+      v, SmallVector<OpFoldResult>{intAttr(offset[0]), intAttr(offset[1])},
       SmallVector<OpFoldResult>{intAttr(shape[0]), intAttr(shape[1])},
       SmallVector<OpFoldResult>{intAttr(1), intAttr(1)});
 
@@ -289,7 +287,8 @@ scf::ForOp Prefetcher::createNewForOp() {
                                            true, dotEncoding, builder));
   }
   // Update ops of yield
-  builder.create<scf::YieldOp>(yieldOp.getLoc(), yieldValues);
+  if (!yieldValues.empty())
+    builder.create<scf::YieldOp>(yieldOp.getLoc(), yieldValues);
   return newForOp;
 }
 

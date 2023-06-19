@@ -1,6 +1,8 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -20,12 +22,11 @@ namespace ttg = triton::gpu;
 #define GEN_PASS_CLASSES
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 
-static Type getI1SameShape(Value v) {
-  Type vType = v.getType();
-  auto i1Type = IntegerType::get(vType.getContext(), 1);
-  auto tensorType = vType.cast<RankedTensorType>();
-  return RankedTensorType::get(tensorType.getShape(), i1Type,
-                               tensorType.getEncoding());
+// pass named attrs (e.g., tt.contiguity) from Triton to Triton
+static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
+  for (const NamedAttribute attr : dictAttrs.getValue())
+    if (!op->hasAttr(attr.getName()))
+      op->setAttr(attr.getName(), attr.getValue());
 }
 
 #define int_attr(num) builder.getI64IntegerAttr(num)
@@ -67,6 +68,23 @@ class LoopPipeliner {
   /// Block arguments that loads depend on
   SetVector<BlockArgument> depArgs;
 
+  /// If we have a load that immediately depends on a block argument in the
+  /// current iteration, it is an immediate dependency. Otherwise, it is a
+  /// non-immediate dependency, which means the load depends on a block argument
+  /// in the previous iterations.
+  /// For example:
+  /// scf.for (%arg0, %arg1, %arg2) {
+  ///   %0 = load %arg0  <--- immediate dep, this address is initialized at
+  ///   numStages-2
+  ///   %1 = load %arg1
+  ///   %2 = add %1, %arg2
+  ///   %3 = load %2  <--- non-immediate dep, %arg1 must be an update-to-date
+  ///   value
+  /// }
+  SetVector<BlockArgument> immedidateDepArgs;
+
+  SetVector<BlockArgument> nonImmedidateDepArgs;
+
   /// Operations (inside the loop body) that loads depend on
   SetVector<Operation *> depOps;
 
@@ -76,6 +94,9 @@ class LoopPipeliner {
   void setValueMapping(Value origin, Value newValue, int stage);
 
   Value lookupOrDefault(Value origin, int stage);
+
+  Value getLoadMask(triton::LoadOp loadOp, Value mappedMask, Value loopCond,
+                    OpBuilder &builder);
 
   /// Returns a empty buffer of size <numStages, ...>
   ttg::AllocTensorOp allocateEmptyBuffer(Operation *op, OpBuilder &builder);
@@ -168,42 +189,48 @@ LogicalResult LoopPipeliner::initialize() {
   }
 
   // can we use forOp.walk(...) here?
-  SmallVector<triton::LoadOp, 2> allLoads;
+  SmallVector<triton::LoadOp, 2> validLoads;
   for (Operation &op : *loop)
     if (auto loadOp = dyn_cast<triton::LoadOp>(&op)) {
       auto ptr = loadOp.getPtr();
       unsigned vec = axisInfoAnalysis->getPtrContiguity(ptr);
+
+      if (auto mask = loadOp.getMask())
+        vec = std::min<unsigned>(vec, axisInfoAnalysis->getMaskAlignment(mask));
+
+      auto lattice = axisInfoAnalysis->getLatticeElement(ptr)->getValue();
       auto tensorTy = ptr.getType().dyn_cast<RankedTensorType>();
-      if (!tensorTy)
+      if (!tensorTy || tensorTy.getRank() < 2)
         continue;
       auto ty = tensorTy.getElementType()
                     .cast<triton::PointerType>()
                     .getPointeeType();
       unsigned width = vec * ty.getIntOrFloatBitWidth();
+      // cp.async's cp-size can only be 4, 8 and 16.
       if (width >= 32)
-        allLoads.push_back(loadOp);
+        validLoads.push_back(loadOp);
     }
 
   // Early stop: no need to continue if there is no load in the loop.
-  if (allLoads.empty())
+  if (validLoads.empty())
     return failure();
 
   // load => values that it depends on
   DenseMap<Value, SetVector<Value>> loadDeps;
-  for (triton::LoadOp loadOp : allLoads) {
+  for (triton::LoadOp loadOp : validLoads) {
     SetVector<Value> deps;
     for (Value op : loadOp->getOperands())
       collectDeps(op, numStages - 1, deps);
     loadDeps[loadOp] = deps;
   }
 
-  // Don't pipeline loads that depend on other loads
-  // (Because if a load depends on another load, this load needs to wait on the
-  //  other load in the prologue, which is against the point of the pipeline
-  //  pass)
-  for (triton::LoadOp loadOp : allLoads) {
+  // Don't pipeline valid loads that depend on other valid loads
+  // (Because if a valid load depends on another valid load, this load needs to
+  // wait on the other load in the prologue, which is against the point of the
+  // pipeline pass)
+  for (triton::LoadOp loadOp : validLoads) {
     bool isCandidate = true;
-    for (triton::LoadOp other : allLoads) {
+    for (triton::LoadOp other : validLoads) {
       if (loadDeps[loadOp].contains(other)) {
         isCandidate = false;
         break;
@@ -260,18 +287,52 @@ LogicalResult LoopPipeliner::initialize() {
   if (!loads.empty()) {
     // Update depArgs & depOps
     for (Value loadOp : loads) {
-      for (Value dep : loadDeps[loadOp]) {
-        // TODO: we should record the stage that the value is depended on
-        if (auto arg = dep.dyn_cast<BlockArgument>())
+      auto &deps = loadDeps[loadOp];
+      for (auto &dep : deps) {
+        if (auto arg = dep.dyn_cast<BlockArgument>()) {
           depArgs.insert(arg);
-        else
+          if (deps.front().isa<BlockArgument>()) {
+            immedidateDepArgs.insert(arg);
+          } else {
+            nonImmedidateDepArgs.insert(arg);
+          }
+        } else
           depOps.insert(dep.getDefiningOp());
       }
     }
     return success();
   }
 
+  // Check if immedidateDepArgs and nonImmedidateDepArgs are disjoint
+  // If yes, we cannot pipeline the loop for now
+  for (BlockArgument arg : immedidateDepArgs)
+    if (nonImmedidateDepArgs.contains(arg)) {
+      return failure();
+    }
+
   return failure();
+}
+
+Value LoopPipeliner::getLoadMask(triton::LoadOp loadOp, Value mappedMask,
+                                 Value loopCond, OpBuilder &builder) {
+  Type maskType = triton::getI1SameShape(loadOp.getType());
+  Value mask = loadOp.getMask();
+  Value newMask;
+  if (mask) {
+    Value cond = loopCond;
+    if (isa<RankedTensorType>(maskType)) {
+      cond = builder.create<triton::SplatOp>(mask.getLoc(), maskType, loopCond);
+    }
+    newMask = builder.create<arith::AndIOp>(mask.getLoc(), mappedMask, cond);
+  } else {
+    if (isa<RankedTensorType>(maskType)) {
+      newMask = builder.create<triton::SplatOp>(loopCond.getLoc(), maskType,
+                                                loopCond);
+    } else {
+      newMask = loopCond;
+    }
+  }
+  return newMask;
 }
 
 void LoopPipeliner::emitPrologue() {
@@ -318,17 +379,9 @@ void LoopPipeliner::emitPrologue() {
         }
         // load => copy async
         if (auto loadOp = llvm::dyn_cast<triton::LoadOp>(op)) {
-          Value mask = lookupOrDefault(loadOp.getMask(), stage);
-          Value newMask;
-          if (mask) {
-            Value splatCond = builder.create<triton::SplatOp>(
-                mask.getLoc(), mask.getType(), loopCond);
-            newMask =
-                builder.create<arith::AndIOp>(mask.getLoc(), mask, splatCond);
-          } else {
-            newMask = builder.create<triton::SplatOp>(
-                loopCond.getLoc(), getI1SameShape(loadOp), loopCond);
-          }
+          Value newMask =
+              getLoadMask(loadOp, lookupOrDefault(loadOp.getMask(), stage),
+                          loopCond, builder);
           // TODO: check if the hardware supports async copy
           newOp = builder.create<triton::gpu::InsertSliceAsyncOp>(
               op->getLoc(), loadsBuffer[loadOp].getType(),
@@ -341,7 +394,20 @@ void LoopPipeliner::emitPrologue() {
         } else
           llvm_unreachable("This should be LoadOp");
       } else {
-        newOp = builder.clone(*op);
+        if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+          Value newMask =
+              getLoadMask(loadOp, lookupOrDefault(loadOp.getMask(), stage),
+                          loopCond, builder);
+          newOp = builder.create<triton::LoadOp>(
+              loadOp.getLoc(), loadOp.getResult().getType(),
+              lookupOrDefault(loadOp.getPtr(), stage), newMask,
+              lookupOrDefault(loadOp.getOther(), stage),
+              loadOp.getBoundaryCheckAttr(), loadOp.getPaddingAttr(),
+              loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
+          addNamedAttrs(newOp, op->getAttrDictionary());
+        } else {
+          newOp = builder.clone(*op);
+        }
         // Update loop-carried uses
         for (unsigned opIdx = 0; opIdx < op->getNumOperands(); ++opIdx) {
           auto it = valueMapping.find(op->getOperand(opIdx));
@@ -394,7 +460,7 @@ void LoopPipeliner::emitPrologue() {
     sliceType = RankedTensorType::get({bufferShape[1], bufferShape[2]},
                                       sliceType.getElementType(),
                                       loadsBufferType[loadOp].getEncoding());
-    Value extractSlice = builder.create<tensor::ExtractSliceOp>(
+    Value extractSlice = builder.create<triton::gpu::ExtractSliceOp>(
         loadOp.getLoc(), sliceType, loadStageBuffer[loadOp][numStages - 1],
         SmallVector<OpFoldResult>{int_attr(0), int_attr(0), int_attr(0)},
         SmallVector<OpFoldResult>{int_attr(1),
@@ -425,7 +491,10 @@ scf::ForOp LoopPipeliner::createNewForOp() {
   //   (original args)
   //   (insertSliceAsync buffer at stage numStages - 1) for each load
   //   (extracted tensor) for each load
-  //   (depArgs at stage numStages - 2)
+  //   (depArgs at stage numStages - 1):
+  //   for each dep arg that is not an immediate block argument
+  //   (depArgs at stage numStages - 2):
+  //   for each dep arg that is an immediate block argument
   //   (iv at stage numStages - 2)
   //   (pipeline iteration index)
   //   (loop iteration index)
@@ -446,7 +515,10 @@ scf::ForOp LoopPipeliner::createNewForOp() {
   size_t depArgsBeginIdx = newLoopArgs.size();
   for (BlockArgument depArg : depArgs) {
     depArgsIdx[depArg] = newLoopArgs.size();
-    newLoopArgs.push_back(valueMapping[depArg][numStages - 2]);
+    if (immedidateDepArgs.contains(depArg)) {
+      newLoopArgs.push_back(valueMapping[depArg][numStages - 2]);
+    } else
+      newLoopArgs.push_back(valueMapping[depArg][numStages - 1]);
   }
 
   size_t nextIVIdx = newLoopArgs.size();
@@ -480,15 +552,25 @@ scf::ForOp LoopPipeliner::createNewForOp() {
 
   // 3. replace loads with block args (from prologue)
   for (size_t idx = 0; idx < loads.size(); ++idx) {
+    OpBuilder::InsertionGuard guard(builder);
     Value load = loads[idx];
     assert(load.hasOneUse() &&
            "we assume that this load has one use (ConvertLayout)");
     Value loadUse = load.getUsers().begin()->getResult(0);
-    mapping.lookup(loadUse).replaceAllUsesWith(
+    // set insertion point
+    Value newLoad = mapping.lookup(load);
+    Value newLoadUse = mapping.lookup(loadUse);
+    builder.setInsertionPoint(newLoadUse.getDefiningOp());
+    // create conversion
+    auto cvt = builder.create<ttg::ConvertLayoutOp>(
+        loadUse.getLoc(), loadUse.getType(),
         newForOp.getRegionIterArgs()[loadIdx + idx]);
+
+    // replace uses
+    newLoadUse.replaceAllUsesWith(cvt.getResult());
     // delete old load and layout conversion
-    mapping.lookup(loadUse).getDefiningOp()->erase();
-    mapping.lookup(load).getDefiningOp()->erase();
+    newLoadUse.getDefiningOp()->erase();
+    newLoad.getDefiningOp()->erase();
   }
 
   // 4. prefetch the next iteration
@@ -532,12 +614,25 @@ scf::ForOp LoopPipeliner::createNewForOp() {
   Value extractSliceIndex = builder.create<arith::RemSIOp>(
       nextIV.getLoc(), loopIterIdx,
       builder.create<arith::ConstantIntOp>(nextIV.getLoc(), numStages, 32));
-  extractSliceIndex = builder.create<arith::IndexCastOp>(
-      extractSliceIndex.getLoc(), builder.getIndexType(), extractSliceIndex);
 
   for (Operation *op : orderedDeps)
     if (!loads.contains(op->getResult(0))) {
-      Operation *nextOp = builder.clone(*op, nextMapping);
+      Operation *nextOp;
+      if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+        auto newMask =
+            getLoadMask(loadOp, nextMapping.lookupOrDefault(loadOp.getMask()),
+                        nextLoopCond, builder);
+        nextOp = builder.create<triton::LoadOp>(
+            loadOp.getLoc(), loadOp.getResult().getType(),
+            nextMapping.lookupOrDefault(loadOp.getPtr()), newMask,
+            nextMapping.lookupOrDefault(loadOp.getOther()),
+            loadOp.getBoundaryCheckAttr(), loadOp.getPaddingAttr(),
+            loadOp.getCache(), loadOp.getEvict(), loadOp.getIsVolatile());
+        addNamedAttrs(nextOp, op->getAttrDictionary());
+        nextMapping.map(loadOp.getResult(), nextOp->getResult(0));
+      } else {
+        nextOp = builder.clone(*op, nextMapping);
+      }
 
       auto originYield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
       for (unsigned dstIdx : llvm::seq(unsigned(0), op->getNumResults())) {
@@ -559,21 +654,17 @@ scf::ForOp LoopPipeliner::createNewForOp() {
     // Update loading mask
     if (loads.contains(op->getResult(0))) {
       auto loadOp = llvm::cast<triton::LoadOp>(op);
-      Value mask = loadOp.getMask();
-      Value newMask;
+      auto mask = loadOp.getMask();
+      auto newMask =
+          getLoadMask(loadOp, nextMapping.lookupOrDefault(loadOp.getMask()),
+                      nextLoopCond, builder);
       if (mask) {
-        Value splatCond = builder.create<triton::SplatOp>(
-            mask.getLoc(), mask.getType(), nextLoopCond);
-        newMask = builder.create<arith::AndIOp>(
-            mask.getLoc(), splatCond, nextMapping.lookupOrDefault(mask));
         // If mask is defined outside the loop, don't update the map more than
         // once
         if (!(forOp.isDefinedOutsideOfLoop(mask) && nextMapping.contains(mask)))
-          nextMapping.map(mask, newMask);
-        newMask = nextMapping.lookupOrDefault(loadOp.getMask());
-      } else
-        newMask = builder.create<triton::SplatOp>(
-            loadOp.getLoc(), getI1SameShape(loadOp), nextLoopCond);
+          nextMapping.map(loadOp.getMask(), newMask);
+        newMask = nextMapping.lookupOrDefault(mask);
+      }
       Value insertAsyncOp = builder.create<triton::gpu::InsertSliceAsyncOp>(
           op->getLoc(), loadsBuffer[loadOp].getType(),
           nextMapping.lookupOrDefault(loadOp.getPtr()),
@@ -591,7 +682,7 @@ scf::ForOp LoopPipeliner::createNewForOp() {
                                         sliceType.getElementType(),
                                         loadsBufferType[loadOp].getEncoding());
 
-      nextOp = builder.create<tensor::ExtractSliceOp>(
+      nextOp = builder.create<triton::gpu::ExtractSliceOp>(
           op->getLoc(), sliceType, insertAsyncOp,
           SmallVector<OpFoldResult>{extractSliceIndex, int_attr(0),
                                     int_attr(0)},
@@ -614,35 +705,6 @@ scf::ForOp LoopPipeliner::createNewForOp() {
             depArgsMapping[newArg] = nextOp->getResult(dstIdx);
           }
         }
-      }
-    }
-  }
-
-  {
-    OpBuilder::InsertionGuard guard(builder);
-    for (Operation &op : *newForOp.getBody()) {
-      if (auto dotOp = llvm::dyn_cast<triton::DotOp>(&op)) {
-        builder.setInsertionPoint(&op);
-        auto dotType = dotOp.getType().cast<RankedTensorType>();
-        Value a = dotOp.getA();
-        Value b = dotOp.getB();
-        auto layoutCast = [&](Value dotOperand, int opIdx) -> Value {
-          auto tensorType = dotOperand.getType().cast<RankedTensorType>();
-          if (!tensorType.getEncoding().isa<ttg::DotOperandEncodingAttr>()) {
-            auto newEncoding = ttg::DotOperandEncodingAttr::get(
-                tensorType.getContext(), opIdx, dotType.getEncoding());
-            auto newType =
-                RankedTensorType::get(tensorType.getShape(),
-                                      tensorType.getElementType(), newEncoding);
-            return builder.create<ttg::ConvertLayoutOp>(dotOperand.getLoc(),
-                                                        newType, dotOperand);
-          }
-          return dotOperand;
-        };
-        a = layoutCast(a, 0);
-        b = layoutCast(b, 1);
-        dotOp->setOperand(0, a);
-        dotOp->setOperand(1, b);
       }
     }
   }
@@ -698,6 +760,17 @@ struct PipelinePass : public TritonGPUPipelineBase<PipelinePass> {
     if (numStages <= 1)
       return;
 
+    // Pre-processing
+    // we make sure element-wise ops are done *after* the conversion
+    // to dot operands
+    // we can achieve this with simple recursive pattern matching
+    // MLIRContext *context = &getContext();
+    // mlir::RewritePatternSet patterns(context);
+    // patterns.add<MoveOpAfterLayoutConversion>(context);
+    // auto didPreprocess =
+    //     applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+
+    // Do the pipelining
     getOperation()->walk([&](scf::ForOp forOp) -> void {
       LoopPipeliner pipeliner(forOp, numStages);
 
@@ -707,7 +780,6 @@ struct PipelinePass : public TritonGPUPipelineBase<PipelinePass> {
       pipeliner.emitPrologue();
 
       scf::ForOp newForOp = pipeliner.createNewForOp();
-
       pipeliner.emitEpilogue();
 
       // replace the original loop

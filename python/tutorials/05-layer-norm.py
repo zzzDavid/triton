@@ -3,15 +3,19 @@ Layer Normalization
 ====================
 In this tutorial, you will write a high-performance layer normalization
 kernel that runs faster than the PyTorch implementation.
-You will specifically learn about:
 
-- How to implement backward pass in Triton
-- How to implement parallel reduction in Triton
+In doing so, you will learn about:
+
+* Implementing backward pass in Triton.
+
+* Implementing parallel reduction in Triton.
+
 """
 
 # %%
 # Motivations
-# -------------
+# -----------
+#
 # The *LayerNorm* operator was first introduced in [BA2016]_ as a way to improve the performance
 # of sequential models (e.g., Transformers) or neural networks with small batch size.
 # It takes a vector :math:`x` as input and produces a vector :math:`y` of the same shape as output.
@@ -23,7 +27,7 @@ You will specifically learn about:
 #    y = \frac{ x - \text{E}[x] }{ \sqrt{\text{Var}(x) + \epsilon} } * w + b
 #
 # where :math:`\epsilon` is a small constant added to the denominator for numerical stability.
-# Let’s first take a look at the foward pass implementation.
+# Let’s first take a look at the forward pass implementation.
 
 import torch
 
@@ -91,7 +95,8 @@ def _layer_norm_fwd_fused(
 
 # %%
 # Backward pass
-# ---------------------------------
+# -------------
+#
 # The backward pass for the layer normalization operator is a bit more involved than the forward pass.
 # Let :math:`\hat{x}` be the normalized inputs :math:`\frac{ x - \text{E}[x] }{ \sqrt{\text{Var}(x) + \epsilon} }` before the linear transformation,
 # the Vector-Jacobian Products (VJP) :math:`\nabla_{x}` of :math:`x` are given by:
@@ -218,7 +223,8 @@ def _layer_norm_bwd_dwdb(
 
 # %%
 # Benchmark
-# ---------------------------------
+# ---------
+#
 # We can now compare the performance of our kernel against that of PyTorch.
 # Here we focus on inputs that have Less than 64KB per feature.
 # Specifically, one can set :code:`'mode': 'backward'` to benchmark the backward pass.
@@ -308,10 +314,10 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     y_ref.backward(dy, retain_graph=True)
     dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
     # compare
-    triton.testing.assert_almost_equal(y_tri, y_ref)
-    triton.testing.assert_almost_equal(dx_tri, dx_ref)
-    triton.testing.assert_almost_equal(db_tri, db_ref, decimal=1)
-    triton.testing.assert_almost_equal(dw_tri, dw_ref, decimal=1)
+    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
 
 @triton.testing.perf_report(
@@ -336,6 +342,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
+    quantiles = [0.5, 0.2, 0.8]
     # utility functions
     if provider == 'triton':
         y_fwd = lambda: layer_norm(x, w_shape, weight, bias, eps)
@@ -347,13 +354,13 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     # forward pass
     if mode == 'forward':
         gbps = lambda ms: 2 * x.numel() * x.element_size() / ms * 1e-6
-        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, rep=500)
+        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
     # backward pass
     if mode == 'backward':
         gbps = lambda ms: 3 * x.numel() * x.element_size() / ms * 1e-6
         y = y_fwd()
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True),
-                                                     grad_to_none=[x], rep=500)
+                                                     quantiles=quantiles, grad_to_none=[x], rep=500)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
@@ -362,6 +369,6 @@ bench_layer_norm.run(save_path='.', print_data=True)
 
 # %%
 # References
-# --------------
+# ----------
 #
 # .. [BA2016] Jimmy Lei Ba and Jamie Ryan Kiros and Geoffrey E. Hinton, "Layer Normalization", Arxiv 2016

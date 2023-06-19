@@ -10,49 +10,38 @@
 namespace mlir {
 
 bool ReduceOpHelper::isFastReduction() {
-  auto srcLayout = srcTy.getEncoding();
-  auto axis = op.getAxis();
-  return axis == triton::gpu::getOrder(srcLayout)[0];
+  return axis == triton::gpu::getOrder(getSrcLayout())[0];
 }
 
 unsigned ReduceOpHelper::getInterWarpSize() {
-  auto srcLayout = srcTy.getEncoding();
-  auto srcShape = srcTy.getShape();
-  auto axis = op.getAxis();
   auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
   unsigned sizeIntraWarps = getIntraWarpSize();
   return std::min(srcReduceDimSize / sizeIntraWarps,
-                  triton::gpu::getWarpsPerCTA(srcLayout)[axis]);
+                  triton::gpu::getWarpsPerCTA(getSrcLayout())[axis]);
 }
 
 unsigned ReduceOpHelper::getIntraWarpSize() {
-  auto srcLayout = srcTy.getEncoding();
-  auto srcShape = srcTy.getShape();
-  auto axis = op.getAxis();
   auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
   return std::min(srcReduceDimSize,
-                  triton::gpu::getThreadsPerWarp(srcLayout)[axis]);
+                  triton::gpu::getThreadsPerWarp(getSrcLayout())[axis]);
 }
 
 unsigned ReduceOpHelper::getThreadsReductionAxis() {
-  auto srcLayout = srcTy.getEncoding();
-  auto axis = op.getAxis();
+  auto srcLayout = getSrcLayout();
   return triton::gpu::getThreadsPerWarp(srcLayout)[axis] *
          triton::gpu::getWarpsPerCTA(srcLayout)[axis];
 }
 
 SmallVector<unsigned> ReduceOpHelper::getScratchConfigBasic() {
-  auto axis = op.getAxis();
   auto smemShape = convertType<unsigned>(getSrcShape());
   smemShape[axis] = std::min(smemShape[axis], getThreadsReductionAxis());
   return smemShape;
 }
 
 SmallVector<SmallVector<unsigned>> ReduceOpHelper::getScratchConfigsFast() {
-  auto axis = op.getAxis();
   SmallVector<SmallVector<unsigned>> smemShapes(3);
 
-  auto argLayout = srcTy.getEncoding();
+  auto argLayout = getSrcLayout();
   auto argLayoutMma = argLayout.dyn_cast<triton::gpu::MmaEncodingAttr>();
   if (argLayoutMma && argLayoutMma.getVersionMajor() == 2 &&
       triton::gpu::getWarpsPerCTA(argLayout)[axis] == 1)
@@ -64,7 +53,7 @@ SmallVector<SmallVector<unsigned>> ReduceOpHelper::getScratchConfigsFast() {
 
   /// FIXME(Qingyi): This size is actually larger than required.
   /// shared memory block1:
-  auto mod = op.getOperation()->getParentOfType<ModuleOp>();
+  auto mod = op->getParentOfType<ModuleOp>();
   unsigned numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
   smemShapes[1].push_back(numWarps * 32);
 
@@ -82,13 +71,24 @@ unsigned ReduceOpHelper::getScratchSizeInBytes() {
     elems = product<unsigned>(smemShape);
   }
 
-  auto tensorType = op.getOperand().getType().cast<RankedTensorType>();
-  unsigned bytes = elems * tensorType.getElementTypeBitWidth() / 8;
+  unsigned bytesPerElem = 0;
+  for (const auto &ty : srcElementTypes) {
+    bytesPerElem += ty.getIntOrFloatBitWidth() / 8;
+  }
+  return bytesPerElem * elems;
+}
 
-  if (triton::ReduceOp::withIndex(op.getRedOp()))
-    bytes += elems * sizeof(int32_t);
-
-  return bytes;
+bool ReduceOpHelper::isSupportedLayout() {
+  auto srcLayout = getSrcLayout();
+  if (srcLayout.isa<triton::gpu::BlockedEncodingAttr>()) {
+    return true;
+  }
+  if (auto mmaLayout = srcLayout.dyn_cast<triton::gpu::MmaEncodingAttr>()) {
+    if (mmaLayout.isAmpere()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool isSharedEncoding(Value value) {
@@ -114,7 +114,7 @@ bool maybeSharedAllocationOp(Operation *op) {
 }
 
 bool maybeAliasOp(Operation *op) {
-  return isa<tensor::ExtractSliceOp>(op) || isa<triton::TransOp>(op) ||
+  return isa<triton::gpu::ExtractSliceOp>(op) || isa<triton::TransOp>(op) ||
          isa<triton::gpu::InsertSliceAsyncOp>(op) ||
          isa<tensor::InsertSliceOp>(op);
 }
@@ -157,14 +157,18 @@ std::string getValueOperandName(Value value, AsmState &state) {
   return opName;
 }
 
-bool isMmaToDotShortcut(triton::gpu::MmaEncodingAttr &mmaLayout,
-                        triton::gpu::DotOperandEncodingAttr &dotOperandLayout) {
+bool isMmaToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstTy) {
   // dot_op<opIdx=0, parent=#mma> = #mma
   // when #mma = MmaEncoding<version=2, warpsPerCTA=[..., 1]>
+  auto srcLayout = srcTy.getEncoding();
+  auto dstLayout = dstTy.getEncoding();
+  auto mmaLayout = srcLayout.cast<triton::gpu::MmaEncodingAttr>();
+  auto dotOperandLayout = dstLayout.cast<triton::gpu::DotOperandEncodingAttr>();
   return mmaLayout.getVersionMajor() == 2 &&
          mmaLayout.getWarpsPerCTA()[1] == 1 &&
          dotOperandLayout.getOpIdx() == 0 &&
-         dotOperandLayout.getParent() == mmaLayout;
+         dotOperandLayout.getParent() == mmaLayout &&
+         !srcTy.getElementType().isF32();
 }
 
 bool isSingleValue(Value value) {
@@ -331,7 +335,8 @@ namespace {
 // Copied from TestDeadCodeAnalysis.cpp, because some dead code analysis
 // interacts with constant propagation, but SparseConstantPropagation
 // doesn't seem to be sufficient.
-struct ConstantAnalysis : public DataFlowAnalysis {
+class ConstantAnalysis : public DataFlowAnalysis {
+public:
   using DataFlowAnalysis::DataFlowAnalysis;
 
   LogicalResult initialize(Operation *top) override {
@@ -353,12 +358,19 @@ struct ConstantAnalysis : public DataFlowAnalysis {
                                        value, op->getDialect())));
       return success();
     }
+    // Dead code analysis requires every operands has initialized ConstantValue
+    // state before it is visited.
+    // https://github.com/llvm/llvm-project/blob/2ec1aba2b69faa1de5f71832a48e25aa3b5d5314/mlir/lib/Analysis/DataFlow/DeadCodeAnalysis.cpp#L322
+    // That's why we need to set all operands to unknown constants.
     setAllToUnknownConstants(op->getResults());
-    for (Region &region : op->getRegions())
-      setAllToUnknownConstants(region.getArguments());
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region.getBlocks())
+        setAllToUnknownConstants(block.getArguments());
+    }
     return success();
   }
 
+private:
   /// Set all given values as not constants.
   void setAllToUnknownConstants(ValueRange values) {
     dataflow::ConstantValue unknownConstant(nullptr, nullptr);
