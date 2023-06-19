@@ -450,21 +450,12 @@ llvm::SmallVector<Type> ReduceOp::getElementTypes() {
 unsigned ReduceOp::getNumOperands() { return this->getOperands().size(); }
 
 //-- SplatOp --
-// OpFoldResult SplatOp::fold(FoldAdaptor adaptor) {
-//   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
-//   if (!constOperand)
-//     return {};
-//   auto shapedType = getType().cast<ShapedType>();
-//   auto ret = SplatElementsAttr::get(
-//       shapedType, ArrayRef<Attribute>(constOperand.getValue()));
-//   return ret;
-// }
 OpFoldResult SplatOp::fold(ArrayRef<Attribute> operands) {
   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
   if (!constOperand)
     return {};
   auto shapedType = getType().cast<ShapedType>();
-  auto ret = SplatElementsAttr::get(shapedType, ArrayRef<Attribute>(value));
+  auto ret = SplatElementsAttr::get(shapedType, ArrayRef<Attribute>(constOperand.getValue()));
   return ret;
 }
 
@@ -497,29 +488,24 @@ mlir::LogicalResult mlir::triton::ExpandDimsOp::inferReturnTypes(
   return mlir::success();
 }
 
-//-- BroadcastOp --
-// OpFoldResult BroadcastOp::fold(FoldAdaptor adaptor) {
-//   auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
-//   if (!constOperand)
-//     return {};
+LogicalResult ExpandDimsOp::canonicalize(ExpandDimsOp op,
+                                         PatternRewriter &rewriter) {
+  auto definingOp = op.getOperand().getDefiningOp();
+  if (!definingOp) {
+    return mlir::failure();
+  }
+  // expand_dims(splat) -> splat
+  if (auto splat = dyn_cast<triton::SplatOp>(definingOp)) {
+    rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op.getType(),
+                                                 splat.getOperand());
+    return mlir::success();
+  }
+  return mlir::failure();
+}
 
-//   auto shapedType = getType().cast<ShapedType>();
-//   auto value = constOperand.getValue();
-//   if (auto denseElemsAttr = value.dyn_cast<DenseElementsAttr>()) {
-//     if (!denseElemsAttr.isSplat())
-//       return {};
-//     return SplatElementsAttr::get(shapedType,
-//                                   denseElemsAttr.getSplatValue<Attribute>());
-//   } else if (value.getType().isIntOrIndexOrFloat()) {
-//     return SplatElementsAttr::get(shapedType, value);
-//   } else {
-//     return {};
-//   }
-// }
-
-OpFoldResult BroadcastOp::fold(ArrayRef<Attribute> operands) {
-  auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
-  if (!constOperand)
+template <typename ViewLikeOp>
+static OpFoldResult foldViewLikeOp(ViewLikeOp op, Attribute value) {
+  if (!value)
     return {};
 
   auto shapedType = op.getType().template cast<mlir::ShapedType>();
@@ -533,8 +519,9 @@ OpFoldResult BroadcastOp::fold(ArrayRef<Attribute> operands) {
   return {};
 }
 
-OpFoldResult ExpandDimsOp::fold(FoldAdaptor adaptor) {
-  return foldViewLikeOp(*this, adaptor.getSrc());
+
+OpFoldResult ExpandDimsOp::fold(ArrayRef<Attribute> operands) {
+  return foldViewLikeOp(*this, operands[0]);
 }
 
 //-- ViewOp --
@@ -566,13 +553,13 @@ LogicalResult ViewOp::canonicalize(ViewOp op, PatternRewriter &rewriter) {
   return canonicalizeViewOrBroadcast(op, rewriter);
 }
 
-OpFoldResult ViewOp::fold(FoldAdaptor adaptor) {
+OpFoldResult ViewOp::fold(ArrayRef<Attribute> operands) {
   if (getType() == getOperand().getType()) {
     // no-op
     return getOperand();
   }
 
-  return foldViewLikeOp(*this, adaptor.getSrc());
+  return foldViewLikeOp(*this, operands[0]);
 }
 
 //-- BroadcastOp --
@@ -581,21 +568,23 @@ LogicalResult BroadcastOp::canonicalize(BroadcastOp op,
   return canonicalizeViewOrBroadcast(op, rewriter);
 }
 
-OpFoldResult BroadcastOp::fold(FoldAdaptor adaptor) {
-  if (getType() == getOperand().getType()) {
-    // no-op
-    return getOperand();
-  }
-
-  auto value = adaptor.getSrc();
-  if (!value)
+OpFoldResult BroadcastOp::fold(ArrayRef<Attribute> operands) {
+  auto constOperand = getSrc().getDefiningOp<arith::ConstantOp>();
+  if (!constOperand)
     return {};
 
-  if (auto denseElemsAttr = value.dyn_cast<SplatElementsAttr>()) {
-    auto shapedType = getType().cast<ShapedType>();
-    return denseElemsAttr.resizeSplat(shapedType);
+  auto shapedType = getType().cast<ShapedType>();
+  auto value = constOperand.getValue();
+  if (auto denseElemsAttr = value.dyn_cast<DenseElementsAttr>()) {
+    if (!denseElemsAttr.isSplat())
+      return {};
+    return SplatElementsAttr::get(shapedType,
+                                  denseElemsAttr.getSplatValue<Attribute>());
+  } else if (value.getType().isIntOrIndexOrFloat()) {
+    return SplatElementsAttr::get(shapedType, value);
+  } else {
+    return {};
   }
-  return {};
 }
 
 //-- MakeTensorPtrOp --

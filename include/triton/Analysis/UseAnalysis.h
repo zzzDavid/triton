@@ -48,6 +48,7 @@ struct UseInfo : public dataflow::AbstractSparseLattice {
     case UseType::MixUse:
       return ChangeResult::NoChange;
     }
+    return ChangeResult::NoChange;
   }
 
   ChangeResult meet(const AbstractSparseLattice &other) override {

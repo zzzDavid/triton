@@ -404,8 +404,10 @@ private:
     if (!mask) {
       assert(!other && "other value used in non-masked load");
       rewriter.create<memref::CopyOp>(loc, ptr, alloc);
+      // Value tensor = rewriter.create<bufferization::ToTensorOp>(
+      //     loc, tensorType, alloc, true /* restrict */, true /* writable */);
       Value tensor = rewriter.create<bufferization::ToTensorOp>(
-          loc, tensorType, alloc, true /* restrict */, true /* writable */);
+          loc, tensorType, alloc);
       rewriter.replaceOp(op, tensor);
       return success();
     }
@@ -466,8 +468,10 @@ private:
     }
 
     rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    // Value tensor = rewriter.create<bufferization::ToTensorOp>(
+    //     loc, tensorType, alloc, true /* restrict */, true /* writable */);
     Value tensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, tensorType, alloc, true /* restrict */, true /* writable */);
+        loc, tensorType, alloc); 
     rewriter.replaceOp(op, tensor);
 
     return success();

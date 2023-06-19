@@ -214,9 +214,9 @@ if(TRITON_BUILD_PYTHON_MODULE)
     TritonAnalysis
     TritonTransforms
     TritonGPUTransforms
-    TritonLLVMIR
+    # TritonLLVMIR
     # TritonPTX
-    TritonHSACO
+    # TritonHSACO
     ${dialect_libs}
     ${conversion_libs}
 

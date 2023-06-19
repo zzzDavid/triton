@@ -153,7 +153,10 @@ public:
         newRet[i] = rewriter.create<triton::gpu::ConvertLayoutOp>(
             op->getLoc(), oldTypes[i], newRet[i]);
     }
-    rewriter.replaceAllUsesWith(reduce.getResult(), newRet);
+    // rewriter.replaceAllUsesWith(reduce.getResult(), newRet);
+    for (auto it : llvm::zip(reduce.getResults(), newRet)) {
+      rewriter.replaceAllUsesWith(std::get<0>(it), std::get<1>(it));
+    }
 
     return success();
   }

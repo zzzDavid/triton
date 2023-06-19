@@ -47,7 +47,9 @@ private:
       combineArgs[acc.size() + i] = cur[i];
     }
 
-    rewriter.inlineBlockBefore(&newReduce, &*rewriter.getInsertionPoint(),
+    // rewriter.inlineBlockBefore(&newReduce, &*rewriter.getInsertionPoint(),
+    //                            combineArgs);
+    rewriter.mergeBlockBefore(&newReduce, &*rewriter.getInsertionPoint(),
                                combineArgs);
 
     auto results = returnOp.getResult();
